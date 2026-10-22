@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# ssm - simple secret manager
+#
+# Cifra/decifra un file con una coppia di chiavi X25519 derivata in modo
+# deterministico da un seed. La chiave privata esiste solo in memoria: non
+# viene mai scritta su disco né passata come argomento a un comando (sarebbe
+# visibile in `ps`); i segreti viaggiano solo su pipe e file descriptor.
+#
+# Schema (ECIES):
+#   priv      = PBKDF2-SHA256(seed, salt fisso, 600000 iter)  -> X25519
+#   eph       = coppia X25519 effimera, nuova a ogni cifratura
+#   shared    = X25519(eph_priv, pub)
+#   enc_key   = SHA3-256("enc" || shared || eph_pub || pub)
+#   mac_key   = SHA3-256("mac" || shared || eph_pub || pub)
+#   file      = "SSM1" || eph_pub || AES-256-CTR(enc_key, dati) || tag
+#   tag       = SHA3-256(mac_key || tutto ciò che precede)
+#
+# Uso:
+#   ssm encrypt <file> [output]     (default: <file>.ssm)
+#   ssm decrypt <file.ssm> [output] (default: <file> senza .ssm; "-" = stdout)
+
+set -euo pipefail
+umask 077
+ulimit -c 0
+
+readonly MAGIC_HEX=53534d31                       # "SSM1"
+readonly KDF_SALT=73736d2d6b646631                # "ssm-kdf1", fisso: la chiave deve essere deterministica
+readonly KDF_ITER=600000
+readonly PKCS8_PREFIX=302e020100300506032b656e04220420  # DER chiave privata X25519
+readonly SPKI_PREFIX=302a300506032b656e032100           # DER chiave pubblica X25519
+readonly TAG_LEN=32
+readonly HEADER_LEN=36                            # magic (4) + eph_pub (32)
+
+SEED= PRIV_HEX= ENC_PASS= MAC_KEY= TMP=
+cleanup() {
+    [[ -n $TMP ]] && rm -f "$TMP"
+    SEED= PRIV_HEX= ENC_PASS= MAC_KEY=
+}
+trap cleanup EXIT
+
+die() { echo "errore: $*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<EOF
+Uso:
+  ${0##*/} encrypt <file> [output]       cifra (default output: <file>.ssm)
+  ${0##*/} decrypt <file.ssm> [output]   decifra (default: senza .ssm, "-" = stdout)
+EOF
+    exit 2
+}
+
+# Conversioni hex <-> binario. hex2bin usa solo il builtin printf, così i
+# segreti non compaiono mai nella command line di un processo.
+hex2bin() { local h=$1 i; for ((i = 0; i < ${#h}; i += 2)); do printf "\\x${h:i:2}"; done; }
+bin2hex() { od -An -v -tx1 | tr -d ' \n'; }
+
+ask_seed() {
+    local confirm
+    read -rsp "Seed: " SEED </dev/tty; echo >&2
+    [[ -n $SEED ]] || die "seed vuoto"
+    if [[ ${1:-} == confirm ]]; then
+        read -rsp "Conferma seed: " confirm </dev/tty; echo >&2
+        [[ $SEED == "$confirm" ]] || die "i seed non coincidono"
+    fi
+}
+
+# seed -> 32 byte di chiave privata X25519 (PBKDF2, seed passato via fd)
+derive_private_key() {
+    local out
+    out=$(openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter "$KDF_ITER" -S "$KDF_SALT" \
+        -P -pass fd:3 3< <(printf '%s\n' "$SEED"))
+    PRIV_HEX=${out#*key=}
+    PRIV_HEX=${PRIV_HEX%%$'\n'*}
+    [[ ${#PRIV_HEX} -eq 64 ]] || die "derivazione chiave fallita"
+}
+
+# $1 = chiave privata (hex) -> chiave pubblica raw (hex)
+public_key() {
+    openssl pkey -inform DER -in <(hex2bin "$PKCS8_PREFIX$1") -pubout -outform DER | bin2hex | tail -c 64
+}
+
+# $1 = chiave privata (hex), $2 = chiave pubblica peer (hex) -> segreto condiviso (hex)
+x25519() {
+    openssl pkeyutl -derive -keyform DER -inkey <(hex2bin "$PKCS8_PREFIX$1") \
+        -peerform DER -peerkey <(hex2bin "$SPKI_PREFIX$2") | bin2hex
+}
+
+# $1 = segreto condiviso, $2 = eph_pub, $3 = pub
+derive_session_keys() {
+    local ctx=$1$2$3
+    ENC_PASS=$({ printf enc; hex2bin "$ctx"; } | openssl dgst -sha3-256 -binary | bin2hex)
+    MAC_KEY=$({ printf mac; hex2bin "$ctx"; } | openssl dgst -sha3-256 -binary | bin2hex)
+}
+
+# stdin -> tag (hex). SHA3 non soffre di length-extension, quindi H(k || m) è un MAC sicuro.
+mac() { { hex2bin "$MAC_KEY"; cat; } | openssl dgst -sha3-256 -binary | bin2hex; }
+
+aes_ctr() { openssl enc -aes-256-ctr -pbkdf2 -iter 1 -pass fd:3 "$@" 3< <(printf '%s\n' "$ENC_PASS"); }
+
+cmd_encrypt() {
+    local in=$1 out=${2:-$1.ssm} pub eph_priv eph_pub shared tag
+    [[ -f $in ]] || die "file non trovato: $in"
+    [[ ! -e $out ]] || die "esiste già: $out"
+
+    ask_seed confirm
+    derive_private_key
+    pub=$(public_key "$PRIV_HEX")
+    PRIV_HEX=
+
+    eph_priv=$(openssl genpkey -algorithm X25519 -outform DER | bin2hex | tail -c 64)
+    eph_pub=$(public_key "$eph_priv")
+    shared=$(x25519 "$eph_priv" "$pub")
+    eph_priv=
+    derive_session_keys "$shared" "$eph_pub" "$pub"
+    shared=
+
+    TMP=$(mktemp "$out.XXXXXX")
+    { hex2bin "$MAGIC_HEX$eph_pub"; aes_ctr -in "$in"; } >"$TMP"
+    tag=$(mac <"$TMP")
+    hex2bin "$tag" >>"$TMP"
+    mv "$TMP" "$out"
+    TMP=
+    echo "cifrato: $out" >&2
+}
+
+cmd_decrypt() {
+    local in=$1 out=${2:-} size header eph_pub pub shared tag
+    [[ -f $in ]] || die "file non trovato: $in"
+    if [[ -z $out ]]; then
+        out=${in%.ssm}
+        [[ $out != "$in" ]] || out=$in.dec
+    fi
+    [[ $out == - || ! -e $out ]] || die "esiste già: $out"
+
+    size=$(stat -c %s "$in")
+    ((size >= HEADER_LEN + TAG_LEN)) || die "file troppo corto"
+    header=$(head -c "$HEADER_LEN" "$in" | bin2hex)
+    [[ ${header:0:8} == "$MAGIC_HEX" ]] || die "formato non riconosciuto"
+    eph_pub=${header:8}
+
+    ask_seed
+    derive_private_key
+    pub=$(public_key "$PRIV_HEX")
+    shared=$(x25519 "$PRIV_HEX" "$eph_pub")
+    PRIV_HEX=
+    derive_session_keys "$shared" "$eph_pub" "$pub"
+    shared=
+
+    # verifica l'integrità prima di produrre qualsiasi output
+    tag=$(tail -c "$TAG_LEN" "$in" | bin2hex)
+    [[ $(head -c $((size - TAG_LEN)) "$in" | mac) == "$tag" ]] || die "seed errato o file corrotto"
+
+    if [[ $out == - ]]; then
+        head -c $((size - TAG_LEN)) "$in" | tail -c +$((HEADER_LEN + 1)) | aes_ctr -d
+    else
+        TMP=$(mktemp "$out.XXXXXX")
+        head -c $((size - TAG_LEN)) "$in" | tail -c +$((HEADER_LEN + 1)) | aes_ctr -d >"$TMP"
+        mv "$TMP" "$out"
+        TMP=
+        echo "decifrato: $out" >&2
+    fi
+}
+
+[[ $# -ge 2 && $# -le 3 ]] || usage
+case $1 in
+    encrypt | enc | e) cmd_encrypt "${@:2}" ;;
+    decrypt | dec | d) cmd_decrypt "${@:2}" ;;
+    *) usage ;;
+esac
